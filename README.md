@@ -13,7 +13,7 @@ strybok.links.listen((link) => router.go(link.routePath));
 await strybok.initialize();
 ```
 
-Full guide, native setup and troubleshooting: [`docs/flutter.md`](./docs/flutter.md).
+Full guide, native setup and troubleshooting: [`doc/flutter.md`](./doc/flutter.md).
 A complete app: [the example app](./example).
 
 - Not published to pub.dev yet: device verification is still pending.

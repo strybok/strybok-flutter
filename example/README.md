@@ -34,4 +34,4 @@ app you need a deployed API and your own application:
      --dart-define=STRYBOK_HOST=<managed hostname>
    ```
 
-4. Follow [`docs/manual-test-plan.md`](../docs/manual-test-plan.md).
+4. Follow [`doc/manual-test-plan.md`](../doc/manual-test-plan.md).

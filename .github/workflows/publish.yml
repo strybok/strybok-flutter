@@ -1,0 +1,40 @@
+# Publishes the package to pub.dev with automated publishing (OIDC): no credentials are stored.
+# pub.dev accepts uploads only from this repository, for tags matching `v{{version}}`
+# (package Admin tab on pub.dev → Automated publishing).
+#
+# Release: bump `version` in pubspec.yaml and add a CHANGELOG entry in the Strybok monorepo,
+# sync this repository, then push a tag `v<version>`.
+name: Publish to pub.dev
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+  id-token: write # lets pub.dev verify that the run comes from this repository
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Obtains the OIDC token `pub publish` uploads with.
+      - uses: dart-lang/setup-dart@v1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.0
+      - run: flutter pub get
+      - run: dart format --output=none --set-exit-if-changed lib test
+      - run: flutter analyze
+      - run: flutter test
+      - name: Check the tag matches pubspec.yaml
+        run: |
+          version=$(grep '^version:' pubspec.yaml | sed 's/version: *//')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version"
+            exit 1
+          fi
+      - run: flutter pub publish --force
