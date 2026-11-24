@@ -16,19 +16,14 @@ await strybok.initialize();
 Full guide, native setup and troubleshooting: [`doc/flutter.md`](./doc/flutter.md).
 A complete app: [the example app](./example).
 
-- Not published to pub.dev yet: device verification is still pending.
+- **Early release (0.1.x)**: covered by unit and widget tests; verification on physical devices
+  is still pending.
 - Deferred deep linking is not supported.
 
 ## Install
 
-In `pubspec.yaml`:
-
-```yaml
-dependencies:
-  strybok:
-    git:
-      url: https://github.com/strybok/strybok-flutter.git
-      ref: 0.1.0
+```sh
+flutter pub add strybok
 ```
 
 ## Build and test

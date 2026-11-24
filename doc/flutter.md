@@ -4,8 +4,9 @@ The `strybok` package receives verified HTTPS links through the
 [`app_links`](https://pub.dev/packages/app_links) plugin, asks the Strybok API which in-app
 route a link stands for, and hands your app each link exactly once.
 
-> **Status:** covered by unit and widget tests. Not yet verified on physical devices
-> (see the [manual test plan](./manual-test-plan.md)) and therefore not published to pub.dev.
+> **Status:** early release (0.1.x), published on [pub.dev](https://pub.dev/packages/strybok).
+> Covered by unit and widget tests; not yet verified on physical devices
+> (see the [manual test plan](./manual-test-plan.md)).
 >
 > Deferred deep linking is **not supported**: a link tapped before the app is installed is not
 > restored after installation.
@@ -20,17 +21,18 @@ route a link stands for, and hands your app each link exactly once.
 
 ## 2. Add the package
 
-The package is not on pub.dev yet. Depend on its git repository in `pubspec.yaml`:
+```sh
+flutter pub add strybok
+```
+
+Or add it to `pubspec.yaml` yourself:
 
 ```yaml
 dependencies:
-  strybok:
-    git:
-      url: https://github.com/strybok/strybok-flutter.git
-      ref: 0.1.0
+  strybok: ^0.1.0
 ```
 
-Or clone the repository and depend on the clone by path (`path: ../strybok-flutter`).
+The source is at [github.com/strybok/strybok-flutter](https://github.com/strybok/strybok-flutter).
 
 ## 3. Disable Flutter's built-in deep link handler
 
