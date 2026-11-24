@@ -73,10 +73,7 @@ void main() {
 
     test('accepts https links on an allowed host with a single slug', () {
       expect(sdk.isStrybokUri(invite), isTrue);
-      expect(
-        sdk.isStrybokUri(Uri.parse('https://MY-APP-123.links.example.com/AbC_7-x')),
-        isTrue,
-      );
+      expect(sdk.isStrybokUri(Uri.parse('https://MY-APP-123.links.example.com/AbC_7-x')), isTrue);
       expect(sdk.isStrybokUri(Uri.parse('https://$host/abc?utm=1#frag')), isTrue);
     });
 
