@@ -1,8 +1,9 @@
 name: strybok
 description: >-
   Flutter SDK for Strybok deep links: receives Universal Links / App Links,
-  resolves them to an in-app route and payload, and delivers each link once.
-version: 0.1.0
+  resolves them to an in-app route and payload, delivers each link once, and
+  creates links to share.
+version: 0.2.0
 homepage: https://strybok.com
 repository: https://github.com/strybok/strybok-flutter
 issue_tracker: https://github.com/strybok/strybok-flutter/issues

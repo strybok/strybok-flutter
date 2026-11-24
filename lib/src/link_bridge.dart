@@ -5,17 +5,21 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'created_link.dart';
 import 'exceptions.dart';
 import 'link_source.dart';
 import 'resolved_deep_link.dart';
 
 /// Version reported with analytics events.
-const String strybokSdkVersion = '0.1.0';
+const String strybokSdkVersion = '0.2.0';
 
 /// Called when a received link could not be turned into a [ResolvedDeepLink].
 typedef LinkErrorHandler = void Function(StrybokException error);
 
 final RegExp _slugPath = RegExp(r'^/[A-Za-z0-9_-]{1,64}$');
+
+/// A key that can be sent as an HTTP header value: visible ASCII only.
+final RegExp _headerSafe = RegExp(r'^[\x21-\x7E]+$');
 
 /// Entry point of the SDK.
 ///
@@ -39,6 +43,7 @@ class Strybok {
     this.dedupeWindow = const Duration(seconds: 2),
     this.reportAppOpens = true,
     this.onError,
+    this.clientKey,
     @visibleForTesting DateTime Function()? clock,
   }) : allowedHosts = {for (final host in allowedHosts) host.toLowerCase()},
        _source = linkSource ?? AppLinksSource(),
@@ -53,11 +58,12 @@ class Strybok {
   /// Link hostnames of this app. Links on any other host are ignored.
   final Set<String> allowedHosts;
 
-  /// Time allowed for a single resolve attempt.
+  /// Time allowed for a single attempt of a resolve or [createLink] request.
   final Duration timeout;
 
   /// Extra attempts after a timeout, network error or 5xx. Resolving is an
-  /// idempotent GET, so retrying is safe. `404` is never retried.
+  /// idempotent GET and creating a link returns the same link for the same
+  /// content, so retrying is safe. Other answers (`4xx`) are never retried.
   final int maxRetries;
 
   /// Pause before the first retry; doubles for each further retry.
@@ -73,6 +79,11 @@ class Strybok {
   /// Receives errors for links that arrived from the OS but could not be
   /// resolved. Links that are simply not ours are ignored without an error.
   final LinkErrorHandler? onError;
+
+  /// Publishable key (`pk_…`) of the application, from "Links from the app" in
+  /// the dashboard. Only needed for [createLink]. It is safe to ship inside the
+  /// app; never put a secret API key (`lb_…`) here.
+  final String? clientKey;
 
   final LinkSource _source;
   final http.Client _http;
@@ -155,32 +166,105 @@ class Strybok {
     final lookup = Uri(scheme: 'https', host: uri.host.toLowerCase(), path: uri.path);
     final endpoint = _endpoint('/v1/public/resolve', {'url': '$lookup'});
 
-    StrybokException? lastError;
-    for (var attempt = 0; attempt <= maxRetries; attempt++) {
-      if (attempt > 0) await Future<void>.delayed(retryDelay * (1 << (attempt - 1)));
-      _checkNotDisposed();
-      try {
-        final response = await _http
-            .get(endpoint, headers: const {'Accept': 'application/json'})
-            .timeout(timeout);
-        if (response.statusCode == 200) return _parse(uri, response.body);
-        if (response.statusCode == 404) throw LinkNotFoundException(uri: uri);
-        final error = StrybokServerException(
-          'Unexpected status ${response.statusCode}',
-          uri: uri,
-          statusCode: response.statusCode,
-        );
-        if (response.statusCode < 500) throw error; // Client errors will not improve.
-        lastError = error;
-      } on StrybokException {
-        rethrow;
-      } on TimeoutException {
-        lastError = StrybokTimeoutException(uri: uri);
-      } catch (error) {
-        lastError = StrybokNetworkException('Network error', uri: uri, cause: error);
-      }
+    final response = await _send(
+      () => _http.get(endpoint, headers: const {'Accept': 'application/json'}),
+      uri: uri,
+      timeoutMessage: 'The resolve request timed out',
+    );
+    if (response.statusCode == 200) return _parse(uri, response.body);
+    if (response.statusCode == 404) throw LinkNotFoundException(uri: uri);
+    throw StrybokServerException(
+      'Unexpected status ${response.statusCode}',
+      uri: uri,
+      statusCode: response.statusCode,
+    );
+  }
+
+  /// Asks the service for a short link to [routePath], a screen of this app —
+  /// the "Share" button. Share [CreatedLink.url].
+  ///
+  /// Needs [clientKey], and the route must be covered by the route patterns
+  /// listed for the application in the dashboard. [payload] is a JSON object
+  /// delivered with the link; [title], [description] and [imageUrl] are shown
+  /// in link previews. Arguments left out are not sent. Do not put personal
+  /// data in a route or payload: whoever receives the link can read them.
+  ///
+  /// It runs only when called: [initialize] and incoming links never depend on
+  /// it, and it works before or without [initialize]. Asking again with the
+  /// same content returns the same link, so timeouts, network errors and 5xx
+  /// are retried like in [resolveUri].
+  ///
+  /// Throws a [StrybokException], never passed to [onError]:
+  /// [StrybokUnauthorizedException], [RouteNotAllowedException] and
+  /// [StrybokValidationException] need a change in the app or the dashboard;
+  /// [StrybokRateLimitedException], [StrybokNetworkException],
+  /// [StrybokTimeoutException] and [StrybokServerException] are temporary.
+  Future<CreatedLink> createLink(
+    String routePath, {
+    Map<String, Object?>? payload,
+    String? title,
+    String? description,
+    Uri? imageUrl,
+  }) async {
+    _checkNotDisposed();
+    final key = clientKey;
+    if (key == null || key.isEmpty) {
+      throw const StrybokUnauthorizedException('No client key is configured');
     }
-    throw lastError!;
+    if (!_headerSafe.hasMatch(key)) {
+      // It could not be sent as a header, and no key the service issues looks like this.
+      throw const StrybokUnauthorizedException('The client key is not valid');
+    }
+    if (!routePath.startsWith('/') || routePath.startsWith('//')) {
+      throw const StrybokValidationException('routePath must start with a single "/"');
+    }
+    if (routePath.length > 512) {
+      throw const StrybokValidationException('routePath must be at most 512 characters');
+    }
+    // Encoded once, so every retry sends exactly the same bytes.
+    final List<int> body;
+    try {
+      body = utf8.encode(
+        jsonEncode({
+          'routePath': routePath,
+          'payload': ?payload,
+          'title': ?title,
+          'description': ?description,
+          if (imageUrl != null) 'imageUrl': '$imageUrl',
+        }),
+      );
+    } on JsonUnsupportedObjectError {
+      throw const StrybokValidationException('payload must contain only JSON values');
+    }
+    final endpoint = _endpoint('/v1/public/links');
+    final headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-Strybok-Key': key,
+    };
+
+    final response = await _send(
+      () => _http.post(endpoint, headers: headers, body: body),
+      timeoutMessage: 'The create-link request timed out',
+    );
+    final status = response.statusCode;
+    switch (status) {
+      case 200 || 201:
+        return _parseCreated(response.body, status);
+      case 401:
+        throw const StrybokUnauthorizedException();
+      case 403:
+        throw RouteNotAllowedException(routePath);
+      case 429:
+        final seconds = int.tryParse(response.headers['retry-after']?.trim() ?? '');
+        throw StrybokRateLimitedException(
+          retryAfter: seconds != null && seconds >= 0 ? Duration(seconds: seconds) : null,
+        );
+      case 400 || 413 || 422:
+        throw _validationError(response.body, status);
+      default:
+        throw StrybokServerException('Unexpected status $status', statusCode: status);
+    }
   }
 
   /// Stops listening and releases resources. The instance cannot be reused.
@@ -236,6 +320,76 @@ class Strybok {
         if (!_controller.isClosed) _controller.add(link);
       }
     });
+  }
+
+  /// Sends a request with [timeout] and retries. Returns the first answer
+  /// below 500; throws the last error once the attempts are used up.
+  Future<http.Response> _send(
+    Future<http.Response> Function() request, {
+    Uri? uri,
+    required String timeoutMessage,
+  }) async {
+    late StrybokException lastError;
+    for (var attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(retryDelay * (1 << (attempt - 1)));
+      _checkNotDisposed();
+      try {
+        final response = await request().timeout(timeout);
+        if (response.statusCode < 500) return response; // Client errors will not improve.
+        lastError = StrybokServerException(
+          'Unexpected status ${response.statusCode}',
+          uri: uri,
+          statusCode: response.statusCode,
+        );
+      } on TimeoutException {
+        lastError = StrybokTimeoutException(uri: uri, message: timeoutMessage);
+      } catch (error) {
+        lastError = StrybokNetworkException('Network error', uri: uri, cause: error);
+      }
+    }
+    throw lastError;
+  }
+
+  CreatedLink _parseCreated(String body, int status) {
+    try {
+      final json = jsonDecode(body);
+      if (json case {
+        'linkId': final String linkId,
+        'slug': final String slug,
+        'routePath': final String routePath,
+        'url': final String url,
+      } when url.startsWith('https://')) {
+        final parsed = Uri.tryParse(url);
+        if (parsed != null && parsed.host.isNotEmpty) {
+          return CreatedLink(url: parsed, slug: slug, routePath: routePath, linkId: linkId);
+        }
+      }
+    } on FormatException {
+      // Fall through to the error below.
+    }
+    throw StrybokServerException('Malformed create-link response', statusCode: status);
+  }
+
+  /// Keeps the service's explanation (`error.message`, `error.details.issues`).
+  StrybokValidationException _validationError(String body, int status) {
+    var message = 'The request was rejected (status $status)';
+    final issues = <StrybokValidationIssue>[];
+    try {
+      if (jsonDecode(body) case {'error': final Map<String, dynamic> error}) {
+        if (error['message'] case final String text when text.isNotEmpty) message = text;
+        if (error['details'] case {'issues': final List<dynamic> list}) {
+          for (final issue in list) {
+            if (issue case {'message': final String text}) {
+              final path = issue['path'];
+              issues.add(StrybokValidationIssue(path: path is String ? path : '', message: text));
+            }
+          }
+        }
+      }
+    } on FormatException {
+      // No readable explanation; the status is all we know.
+    }
+    return StrybokValidationException(message, issues: List.unmodifiable(issues));
   }
 
   ResolvedDeepLink _parse(Uri uri, String body) {
