@@ -6,12 +6,14 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'created_link.dart';
+import 'deferred_links.dart';
 import 'exceptions.dart';
+import 'link_campaign.dart';
 import 'link_source.dart';
 import 'resolved_deep_link.dart';
 
 /// Version reported with analytics events.
-const String strybokSdkVersion = '0.2.0';
+const String strybokSdkVersion = '0.3.0';
 
 /// Called when a received link could not be turned into a [ResolvedDeepLink].
 typedef LinkErrorHandler = void Function(StrybokException error);
@@ -44,13 +46,44 @@ class Strybok {
     this.reportAppOpens = true,
     this.onError,
     this.clientKey,
+    bool deferredLinks = false,
+    this.allowProbabilisticMatching = false,
+    List<InstallReferrerSource> installReferrerSources = const [],
+    this.androidPackageName,
+    this.iosBundleId,
+    FutureOr<String?> Function()? deviceFamily,
+    FutureOr<String?> Function()? locale,
+    Future<bool> Function()? pasteboardMayContainLink,
+    DeferredLinkStore? deferredLinkStore,
+    @visibleForTesting Duration installReferrerTimeout = const Duration(seconds: 10),
     @visibleForTesting DateTime Function()? clock,
   }) : allowedHosts = {for (final host in allowedHosts) host.toLowerCase()},
        _source = linkSource ?? AppLinksSource(),
        _http = httpClient ?? http.Client(),
        _ownsHttpClient = httpClient == null,
        _now = clock ?? DateTime.now,
-       assert(maxRetries >= 0);
+       assert(maxRetries >= 0) {
+    _deferred = DeferredLinkEngine(
+      enabled: deferredLinks,
+      allowProbabilisticMatching: allowProbabilisticMatching,
+      sources: List.unmodifiable(installReferrerSources),
+      androidPackageName: androidPackageName,
+      iosBundleId: iosBundleId,
+      deviceFamily: deviceFamily,
+      locale: locale,
+      pasteboardMayContainLink: pasteboardMayContainLink,
+      store: deferredLinkStore,
+      sourceTimeout: installReferrerTimeout,
+      sdkVersion: strybokSdkVersion,
+      platform: _platform,
+      post: _postDeferred,
+      parse: _parseDeferred,
+      isOurs: isStrybokUri,
+      normalLinkAccepted: () => _normalLinkAccepted,
+      isDisposed: () => _disposed,
+      deliver: _deliver,
+    );
+  }
 
   /// Base URL of the Strybok API, e.g. `https://api.example.com`.
   final Uri apiBaseUrl;
@@ -84,6 +117,28 @@ class Strybok {
   /// the dashboard. Only needed for [createLink]. It is safe to ship inside the
   /// app; never put a secret API key (`lb_…`) here.
   final String? clientKey;
+
+  /// iOS only, and only together with `deferredLinks`: lets the server
+  /// **guess** the link of a first launch from the network address, the device
+  /// family and the language. Off by default.
+  ///
+  /// This is fingerprinting in Apple's terms: the App Store Review Guidelines
+  /// and the Apple Developer Program License Agreement forbid it, with or
+  /// without the user's consent; the App Review and legal risk is the app
+  /// owner's. A match can be another person's link on a shared network, so
+  /// check [ResolvedDeepLink.isProbabilisticMatch]. It also needs the
+  /// `deviceFamily` and `locale` callbacks.
+  final bool allowProbabilisticMatching;
+
+  /// The app's own Android application ID, e.g. `com.example.app`. Required
+  /// for deferred links on Android: the SDK has no native code to read it.
+  final String? androidPackageName;
+
+  /// The app's own iOS bundle identifier. Required for deferred links on iOS.
+  final String? iosBundleId;
+
+  late final DeferredLinkEngine _deferred;
+  bool _normalLinkAccepted = false;
 
   final LinkSource _source;
   final http.Client _http;
@@ -131,7 +186,44 @@ class Strybok {
       initial = null; // The platform could not tell us; treat as "no launch link".
     }
     if (initial != null) await _handle(initial, isInitial: true);
+    // The deferred-link check starts after everything else and nothing waits for it.
+    scheduleMicrotask(_deferred.start);
   }
+
+  /// Where the deferred-link check stands. Readable at any time; it never
+  /// throws and nothing about the check is passed to [onError].
+  DeferredLinkStatus get deferredLinkStatus => _deferred.status;
+
+  /// Every change of [deferredLinkStatus] (a broadcast stream; the current
+  /// value is not replayed).
+  Stream<DeferredLinkStatus> get deferredLinkStatusChanges => _deferred.changes;
+
+  /// Switches deferred links on after construction, for example after a
+  /// consent screen, and runs the check once if [initialize] has completed
+  /// (otherwise it runs after it). Calling it again does nothing.
+  ///
+  /// Without a `deferredLinkStore`, without the identifier of the platform
+  /// ([androidPackageName] / [iosBundleId]) or off Android and iOS the status
+  /// stays [DeferredLinkStatus.disabled].
+  void enableDeferredLinks() => _deferred.enable();
+
+  /// iOS: hands over the text the person pasted, to restore the link they
+  /// copied on the page before the App Store.
+  ///
+  /// The SDK never reads the clipboard: [text] comes from the app's paste
+  /// button. Anything that is not a copied link of this app gives
+  /// [PastedLinkResult.notOurs] without a request, and the text is dropped —
+  /// not stored, not logged, not sent. Of a link of ours only the click id in
+  /// it is sent. A restored link arrives through [links] with
+  /// [ResolvedDeepLink.isDeferred] set, even if another link was delivered
+  /// earlier in this launch. Never throws.
+  Future<PastedLinkResult> redeemPastedLink(String? text) => _deferred.redeemPastedLink(text);
+
+  /// iOS, only with [allowProbabilisticMatching] and a
+  /// `pasteboardMayContainLink` callback: tells the SDK that the person moved
+  /// on without pasting, so matching may start
+  /// ([DeferredLinkStatus.awaitingPaste]). Does nothing otherwise.
+  void skipPastedLink() => _deferred.skipPastedLink();
 
   /// The link that launched the app, if it has not been delivered through
   /// [links] yet. Returns it at most once and removes it from [links], so using
@@ -145,6 +237,7 @@ class Strybok {
 
   /// Whether [uri] looks like a Strybok link of this app: `https`, a host
   /// from [allowedHosts], default port, no credentials and a single slug path.
+  /// Query and fragment do not matter.
   bool isStrybokUri(Uri uri) =>
       uri.scheme == 'https' &&
       allowedHosts.contains(uri.host.toLowerCase()) &&
@@ -162,9 +255,13 @@ class Strybok {
     if (!isStrybokUri(uri)) {
       throw UnsupportedLinkException('Not a link for this app', uri: uri);
     }
-    // Query and fragment are not needed for the lookup and may hold private data.
-    final lookup = Uri(scheme: 'https', host: uri.host.toLowerCase(), path: uri.path);
-    final endpoint = _endpoint('/v1/public/resolve', {'url': '$lookup'});
+    // Of the query only the campaign parameters are sent; the rest and the fragment are not
+    // needed for the lookup and may hold private data.
+    final campaign = campaignQuery(uri.hasQuery ? uri.query : '');
+    final lookup =
+        '${Uri(scheme: 'https', host: uri.host.toLowerCase(), path: uri.path)}'
+        '${campaign.isEmpty ? '' : '?$campaign'}';
+    final endpoint = _endpoint('/v1/public/resolve', {'url': lookup});
 
     final response = await _send(
       () => _http.get(endpoint, headers: const {'Accept': 'application/json'}),
@@ -275,22 +372,22 @@ class Strybok {
     _initialLink = null;
     await _subscription?.cancel();
     await _controller.close();
+    await _deferred.close();
     if (_ownsHttpClient) _http.close();
   }
 
   // ---------------------------------------------------------------------------
 
   Future<void> _handle(Uri uri, {bool isInitial = false}) async {
-    if (_disposed || !isStrybokUri(uri) || _isDuplicate(uri)) return;
+    if (_disposed || !isStrybokUri(uri)) return;
+    // From here on a deferred link is dropped: one launch, one navigation.
+    _normalLinkAccepted = true;
+    if (_isDuplicate(uri)) return;
     try {
       final link = await resolveUri(uri);
       if (_disposed) return; // Disposed while the request was in flight.
       if (isInitial) _initialLink = link;
-      if (_controller.hasListener) {
-        _controller.add(link);
-      } else {
-        _pending.add(link);
-      }
+      _deliver(link);
       if (reportAppOpens) unawaited(_reportAppOpen(link));
     } on StrybokException catch (error) {
       if (!_disposed) onError?.call(error);
@@ -298,6 +395,74 @@ class Strybok {
       // Disposed mid-flight; nothing to deliver.
     }
   }
+
+  void _deliver(ResolvedDeepLink link) {
+    if (_disposed) return;
+    if (_controller.hasListener) {
+      _controller.add(link);
+    } else {
+      _pending.add(link);
+    }
+  }
+
+  /// One deferred-link request with [timeout] and the usual retries. The
+  /// answer, or `null` when none below 500 arrived. Never throws and creates
+  /// no error: a deferred-link check that fails is not a failed link.
+  Future<http.Response?> _postDeferred(String path, List<int> body) async {
+    final endpoint = _endpoint(path);
+    const headers = {'Content-Type': 'application/json', 'Accept': 'application/json'};
+    for (var attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(retryDelay * (1 << (attempt - 1)));
+      if (_disposed) return null;
+      try {
+        // The same bytes on every attempt.
+        final response = await _http.post(endpoint, headers: headers, body: body).timeout(timeout);
+        if (response.statusCode < 500) return response;
+      } catch (_) {
+        // Timeout or transport failure: try again.
+      }
+    }
+    return null;
+  }
+
+  /// A usable redeem or match answer as a link, or `null`.
+  ResolvedDeepLink? _parseDeferred(String body, {required bool probabilistic}) {
+    try {
+      final json = jsonDecode(body);
+      if (json case {
+        'linkId': final String linkId,
+        'appId': final String appId,
+        'routePath': final String routePath,
+        'deferred': true,
+        'url': final String url,
+      } when routePath.startsWith('/') && !routePath.startsWith('//')) {
+        if (probabilistic && json['matched'] != 'probabilistic') return null;
+        final uri = Uri.tryParse(url);
+        // The server is not trusted to name a link of another app.
+        if (uri == null || !isStrybokUri(uri)) return null;
+        final payload = json['payload'];
+        return ResolvedDeepLink(
+          uri: uri,
+          linkId: linkId,
+          appId: appId,
+          routePath: routePath,
+          payload: payload is Map ? Map<String, Object?>.from(payload) : const {},
+          campaign: LinkCampaign.fromJson(json['campaign']),
+          isDeferred: true,
+          isProbabilisticMatch: probabilistic,
+        );
+      }
+    } catch (_) {
+      // Not JSON, or not the shape we know.
+    }
+    return null;
+  }
+
+  static String _platform() => switch (defaultTargetPlatform) {
+    TargetPlatform.iOS => 'ios',
+    TargetPlatform.android => 'android',
+    _ => 'unknown',
+  };
 
   /// The OS (or the plugin) can hand over the same tap twice, e.g. as the
   /// initial link and again on the stream.
@@ -407,6 +572,7 @@ class Strybok {
           appId: appId,
           routePath: routePath,
           payload: payload is Map ? Map<String, Object?>.from(payload) : const {},
+          campaign: LinkCampaign.fromJson(json['campaign']),
         );
       }
     } on FormatException {
@@ -427,12 +593,10 @@ class Strybok {
               'eventId': _uuidV4(),
               'linkId': link.linkId,
               'type': 'app_open',
-              'platform': switch (defaultTargetPlatform) {
-                TargetPlatform.iOS => 'ios',
-                TargetPlatform.android => 'android',
-                _ => 'unknown',
-              },
+              'platform': _platform(),
               'sdkVersion': strybokSdkVersion,
+              // What resolve returned, never read from the URL here; left out when empty.
+              if (link.campaign.isNotEmpty) 'campaign': link.campaign.toJson(),
             }),
           )
           .timeout(timeout);

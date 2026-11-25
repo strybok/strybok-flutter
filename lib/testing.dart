@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 
+import 'src/deferred_links.dart';
 import 'src/link_source.dart';
 
 /// In-memory [LinkSource] to simulate incoming links in unit and widget tests.
@@ -32,4 +33,22 @@ class FakeLinkSource implements LinkSource {
 
   @override
   Stream<Uri> get uriStream => _controller.stream;
+}
+
+/// **For tests only.** A [DeferredLinkStore] that keeps its values in memory.
+///
+/// Never use it in an app: the values are gone when the process ends, so the
+/// deferred-link check would run, and could deliver, again on every launch.
+/// Pass the same instance to a second `Strybok` to simulate a restart.
+class InMemoryDeferredLinkStore implements DeferredLinkStore {
+  InMemoryDeferredLinkStore([Map<String, String>? values]) : values = {...?values};
+
+  /// Everything that was written.
+  final Map<String, String> values;
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String value) async => values[key] = value;
 }
