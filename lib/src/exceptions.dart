@@ -13,7 +13,8 @@ sealed class StrybokException implements Exception {
 }
 
 /// The URI is not a Strybok link for this app: wrong scheme, a host outside
-/// `allowedHosts`, or a path that is not a single slug.
+/// `allowedHosts`, or a path that is not a single slug (with `parameterLinks`:
+/// neither a route path nor a Firebase long link).
 final class UnsupportedLinkException extends StrybokException {
   const UnsupportedLinkException(super.message, {super.uri});
 }

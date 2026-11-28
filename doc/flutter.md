@@ -5,9 +5,13 @@ The `strybok` package receives verified HTTPS links through the
 route a link stands for, and hands your app each link exactly once.
 
 > **Status:** early release (0.x), published on [pub.dev](https://pub.dev/packages/strybok). This
-> guide describes 0.3.0, which may be newer than the version on pub.dev.
+> guide describes 0.4.0, which may be newer than the version on pub.dev.
 > Covered by unit and widget tests; not yet verified on physical devices
 > (see the [manual test plan](./manual-test-plan.md)).
+>
+> Links without an API call (path links and Firebase long links) are **optional and off by
+> default** (the `parameterLinks` option, new in 0.4.0) and unit-tested only. See
+> [Links without an API call](#links-without-an-api-call-optional).
 >
 > Deferred links (a link tapped before the app is installed, restored after installation) are
 > **optional and off by default**, and the package has no native code for them: on Android your
@@ -20,6 +24,7 @@ route a link stands for, and hands your app each link exactly once.
 1. Create an application in Strybok with your iOS and Android identifiers.
 2. Read its setup data: `GET /v1/apps/:appId/integration` returns the managed hostname
    (for example `my-app-x7k2p9.links.example.com`) and ready-to-copy snippets.
+   If the application has an active [custom domain](./ios.md#custom-domain-optional), the same answer lists it in `allowedHosts`: declare it in the entitlement and the intent filter next to the managed hostname and pass both to `allowedHosts`.
 3. Complete the native setup: [Android](./android.md) and [iOS](./ios.md). Without it the OS
    never delivers links to the app, and the SDK has nothing to receive.
 
@@ -33,7 +38,7 @@ Or add it to `pubspec.yaml` yourself:
 
 ```yaml
 dependencies:
-  strybok: ^0.3.0
+  strybok: ^0.4.0
 ```
 
 The source is at [github.com/strybok/strybok-flutter](https://github.com/strybok/strybok-flutter).
@@ -130,7 +135,8 @@ strybok.links.listen((link) {
 | `links`             | Broadcast stream of `ResolvedDeepLink` (`uri`, `linkId`, `appId`, `routePath`, `payload`, `campaign`). |
 | `getInitialLink()`  | The launch link, if not delivered through `links` yet.                                                 |
 | `resolveUri(uri)`   | Resolve a URI explicitly (QR scanner, tests). Does not emit on `links` or report an app open.          |
-| `isStrybokUri(uri)` | Whether a URI is one of this app's links.                                                              |
+| `resolveUrl(url)`   | The same for a URL string exactly as received; prefer it with `parameterLinks`.                        |
+| `isStrybokUri(uri)` | Whether a URI is one of this app's links. `isStrybokUrl(url)` takes a string.                          |
 | `createLink(route)` | Create a link to share (section 5). Needs `clientKey`.                                                 |
 | `dispose()`         | Stop listening and release resources.                                                                  |
 
@@ -141,19 +147,21 @@ you use [deferred links](#deferred-links-optional), which add `deferredLinkStatu
 
 Options: `timeout` (5 s per attempt), `maxRetries` (2; only timeouts, network errors and 5xx are
 retried — resolving is an idempotent GET), `retryDelay`, `dedupeWindow`, `reportAppOpens`,
-`onError`, `clientKey` (only for `createLink`), plus `linkSource` / `httpClient` for tests. The
-deferred-link options are listed in [their section](#deferred-links-optional).
+`onError`, `clientKey` (only for `createLink`), `parameterLinks` (see
+[Links without an API call](#links-without-an-api-call-optional)), plus `linkSource` /
+`httpClient` for tests. The deferred-link options are listed in
+[their section](#deferred-links-optional).
 
 ### Errors
 
 `resolveUri` throws, and `onError` receives, a `StrybokException`:
 
-| Type                                                  | Meaning                                                                                                                                              |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UnsupportedLinkException`                            | Not `https`, host not in `allowedHosts`, or not a single-slug path. Thrown before any network call. Ignored silently for links arriving from the OS. |
-| `LinkNotFoundException`                               | Unknown, disabled or expired link.                                                                                                                   |
-| `StrybokTimeoutException` / `StrybokNetworkException` | No answer after all retries (e.g. offline). The app keeps working; the link is simply not opened.                                                    |
-| `StrybokServerException`                              | Unexpected status or malformed response.                                                                                                             |
+| Type                                                  | Meaning                                                                                                                                                                                                            |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `UnsupportedLinkException`                            | Not `https`, host not in `allowedHosts`, or not a single-slug path (with `parameterLinks`: neither a route path nor a long link). Thrown before any network call. Ignored silently for links arriving from the OS. |
+| `LinkNotFoundException`                               | Unknown, disabled or expired link.                                                                                                                                                                                 |
+| `StrybokTimeoutException` / `StrybokNetworkException` | No answer after all retries (e.g. offline). The app keeps working; the link is simply not opened.                                                                                                                  |
+| `StrybokServerException`                              | Unexpected status or malformed response.                                                                                                                                                                           |
 
 ## 5. Create a link to share
 
@@ -234,7 +242,11 @@ server. The number is self-reported by the app and is not a count of unique peop
 Only the link's host and slug are sent to `resolve`, plus the five `utm_*` campaign parameters of
 the tapped URL when their value passes the character rule
 ([Campaign values](#campaign-values)). Every other query parameter and the fragment stay on the
-device.
+device. With `parameterLinks`, `resolve` also gets the path of a path link and the values of the
+payload keys you configured, or for a Firebase long link the deep link's scheme, host and path,
+its values of those keys and the `apn` and `ibi` parameters
+([Links without an API call](#links-without-an-api-call-optional)). Do not configure keys that
+carry personal data.
 
 With `deferredLinks` on, the SDK also sends what [Deferred links](#deferred-links-optional)
 describes: on Android the code found in the referrer your app passed in, with the package name;
@@ -257,8 +269,72 @@ final strybok = Strybok(
 source.emit(Uri.parse('https://my-app.links.example.com/other'));
 ```
 
+`emit` takes a `Uri`, which `Uri.parse` has already rewritten. To hand over a URL exactly as
+written — to test `parameterLinks` with `https://my-app.links.example.com/a/../b`, say — use
+`source.emitString(url)` and `FakeLinkSource(initialLinkString: url)`.
+
 The example app's [`test/deep_link_test.dart`](../example/test/deep_link_test.dart)
 shows complete widget tests.
+
+## Links without an API call (optional)
+
+The owner of the application can let addresses of its hosts open a route of the app without
+creating a link first (dashboard: **Setup → Links without an API call**, off by default):
+**path links** such as `https://my-app-x7k2p9.links.example.com/product/42?id=7`, and **Firebase
+long links** `https://my-app-x7k2p9.links.example.com/?link=https://example.com/product/42&apn=…`.
+The SDK delivers them only with the `parameterLinks` option, new in 0.4.0. Without it, and in
+earlier versions, a path of several segments and a long link are dropped without a request, and
+a one-segment path is delivered without its payload.
+
+Copy the keys from `parameterLinks` of the integration guide (`GET /v1/apps/:appId/integration`,
+shown on the dashboard's setup screen). It is `null` while both kinds are off; then leave the
+option out.
+
+```dart
+final strybok = Strybok(
+  apiBaseUrl: Uri.parse('https://api.example.com'),
+  allowedHosts: {'my-app-x7k2p9.links.example.com'},
+  parameterLinks: const ParameterLinks(payloadKeys: ['id', 'lang']),
+);
+
+strybok.links.listen((link) {
+  // Tapped: https://my-app-x7k2p9.links.example.com/product/42?id=7&lang=uk
+  // link.routePath == '/product/42' and link.payload == {'id': '7', 'lang': 'uk'},
+  // as the server read them.
+  router.go(link.routePath);
+});
+```
+
+- **What arrives.** A link like any other, on `links` or from `getInitialLink()`, with the route
+  and payload the server read — never the tapped path. Treat them as untrusted, as for every
+  link. The `app_open` event carries the `linkId` the server returned.
+- **What is sent.** The path exactly as received, the first value of each payload key (kept when
+  it is 1–256 characters without control characters) and the `utm_*` values; for a long link the
+  deep link's scheme, host and path with its own values of the payload keys, plus `apn` and
+  `ibi`. Nothing else of the query — not `afl`, `ifl`, `ofl`, `st`, `sd`, `si` or `isi` — and
+  never the fragment.
+- **Which addresses count.** Any address of `allowedHosts` whose path is a valid route (no `//`,
+  no `.` or `..` segment, not `/favicon.ico`, `/robots.txt` or anything under `/.well-known/`) is
+  resolved. Whether a route is allowed is the server's decision, so `onError` gets a
+  `LinkNotFoundException` for an address that is no link, a typo for example.
+- **The keys are compiled in.** Installed builds keep sending the keys they know, and the server
+  ignores keys it no longer allows: a key the owner adds reaches users with your next release.
+  An invalid list — more than 20 keys, a key twice, a key that is not 1–40 characters of
+  `A–Z a–z 0–9 _ . -`, starts with `utm_` or is `st`, `sd`, `si` or `strybok_click` — makes the
+  constructor throw an `ArgumentError`.
+- **Links exactly as received.** The rules read a link as the platform received it:
+  `AppLinksSource`, the default, hands over the platform's strings. A `Uri` has already been
+  rewritten by `Uri.parse`, which removes `.` and `..` segments and changes escapes, so
+  `resolveUri(uri)` and a `LinkSource` of your own that only has `Uri`s read the link as
+  `Uri.parse` left it. Implement `RawLinkSource` (`getInitialLinkString()`, `stringLinkStream`)
+  in such a source, and pass URLs from elsewhere to `resolveUrl(url)`.
+- **Deferred links do not change.** They exist only for links created in advance, so a restored
+  link, and a pasted one on iOS, still has a single slug.
+
+The exact rules are in the
+[SDK contract](./sdk-contract.md#links-without-an-api-call). This is covered by unit tests
+against the shared test vectors of the contract only; it has not run on a device or against the
+production API.
 
 ## Deferred links (optional)
 

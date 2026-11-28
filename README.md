@@ -43,8 +43,31 @@ A complete app: [the example app](./example).
 
 - **Early release (0.x)**: covered by unit and widget tests; verification on physical devices
   is still pending.
+- Links without an API call (path links and Firebase long links) are optional, off by default
+  and unit-tested only; see below.
 - Deferred links (restoring a link tapped before the app was installed) are optional, off by
   default and not run on a device yet; see below.
+
+## Links without an API call (optional)
+
+When the owner has switched on path links (`https://<host>/product/42?id=7`) or Firebase long
+links (`https://<host>/?link=…`) for the application, pass the payload keys from
+`parameterLinks` of the integration guide (`GET /v1/apps/:appId/integration`, shown on the
+dashboard's setup screen):
+
+```dart
+final strybok = Strybok(
+  apiBaseUrl: Uri.parse('https://api.example.com'),
+  allowedHosts: {'my-app-123.links.example.com'},
+  parameterLinks: const ParameterLinks(payloadKeys: ['id', 'lang']),
+);
+```
+
+Such a link arrives on `links` like any other, with the route and payload the server read (never
+the tapped path). Of the URL only the path, the values of these keys and the `utm_*` values are
+sent. Without the option the SDK behaves exactly as 0.3.0. Unit-tested only, never run on a
+device. Details:
+[`doc/flutter.md`](./doc/flutter.md#links-without-an-api-call-optional).
 
 ## Deferred links (optional)
 

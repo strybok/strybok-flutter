@@ -10,10 +10,11 @@ import 'deferred_links.dart';
 import 'exceptions.dart';
 import 'link_campaign.dart';
 import 'link_source.dart';
+import 'parameter_links.dart';
 import 'resolved_deep_link.dart';
 
 /// Version reported with analytics events.
-const String strybokSdkVersion = '0.3.0';
+const String strybokSdkVersion = '0.4.0';
 
 /// Called when a received link could not be turned into a [ResolvedDeepLink].
 typedef LinkErrorHandler = void Function(StrybokException error);
@@ -46,6 +47,7 @@ class Strybok {
     this.reportAppOpens = true,
     this.onError,
     this.clientKey,
+    this.parameterLinks,
     bool deferredLinks = false,
     this.allowProbabilisticMatching = false,
     List<InstallReferrerSource> installReferrerSources = const [],
@@ -57,7 +59,8 @@ class Strybok {
     DeferredLinkStore? deferredLinkStore,
     @visibleForTesting Duration installReferrerTimeout = const Duration(seconds: 10),
     @visibleForTesting DateTime Function()? clock,
-  }) : allowedHosts = {for (final host in allowedHosts) host.toLowerCase()},
+  }) : _payloadKeys = _checkedPayloadKeys(parameterLinks),
+       allowedHosts = {for (final host in allowedHosts) host.toLowerCase()},
        _source = linkSource ?? AppLinksSource(),
        _http = httpClient ?? http.Client(),
        _ownsHttpClient = httpClient == null,
@@ -78,7 +81,9 @@ class Strybok {
       platform: _platform,
       post: _postDeferred,
       parse: _parseDeferred,
-      isOurs: isStrybokUri,
+      // Deferred links are stored links: a pasted link is ours only with a slug, with or
+      // without parameterLinks.
+      isOurs: _isSlugLink,
       normalLinkAccepted: () => _normalLinkAccepted,
       isDisposed: () => _disposed,
       deliver: _deliver,
@@ -118,6 +123,27 @@ class Strybok {
   /// app; never put a secret API key (`lb_…`) here.
   final String? clientKey;
 
+  /// Links without an API call, off by default: deliver path links
+  /// (`https://<host>/product/42?id=7`) and Firebase long links
+  /// (`https://<host>/?link=…`) too, and send the values of these payload keys
+  /// with them. Copy `parameterLinks` of the integration guide
+  /// (`GET /v1/apps/:appId/integration`, shown on the dashboard's setup
+  /// screen); while it is `null` there, leave this `null`.
+  ///
+  /// With it, any address of [allowedHosts] that is a valid route is resolved,
+  /// so [onError] gets a [LinkNotFoundException] for one that is no link. The
+  /// route and payload of a delivered link are those the server read, never
+  /// the tapped path. Without it nothing changes: only single-slug links, and
+  /// of the query only the `utm_*` values.
+  ///
+  /// The constructor throws an [ArgumentError] for an invalid list of keys
+  /// (see [ParameterLinks.payloadKeys]).
+  final ParameterLinks? parameterLinks;
+
+  /// The payload keys of [parameterLinks], copied and checked; `null` without
+  /// the option.
+  final List<String>? _payloadKeys;
+
   /// iOS only, and only together with `deferredLinks`: lets the server
   /// **guess** the link of a first launch from the network address, the device
   /// family and the language. Off by default.
@@ -150,7 +176,7 @@ class Strybok {
 
   /// Links resolved while nobody was listening (typically the cold-start link).
   final List<ResolvedDeepLink> _pending = [];
-  StreamSubscription<Uri>? _subscription;
+  StreamSubscription<Object>? _subscription;
   Future<void>? _initialization;
   ResolvedDeepLink? _initialLink;
   String? _lastUri;
@@ -174,18 +200,34 @@ class Strybok {
   }
 
   Future<void> _initialize() async {
-    // Listen first so a link arriving during start-up is not missed.
-    _subscription = _source.uriStream.listen(
-      (uri) => unawaited(_handle(uri)),
-      onError: (Object _) {},
-    );
-    Uri? initial;
+    final source = _source;
+    // Listen first so a link arriving during start-up is not missed. A source that can hand
+    // over links exactly as received is read that way: a Uri was already rewritten by
+    // Uri.parse.
+    if (source is RawLinkSource) {
+      _subscription = source.stringLinkStream.listen(
+        (url) => unawaited(_handle(url)),
+        onError: (Object _) {},
+      );
+    } else {
+      _subscription = source.uriStream.listen(
+        (uri) => unawaited(_handle('$uri', uri: uri)),
+        onError: (Object _) {},
+      );
+    }
+    String? initial;
+    Uri? initialUri;
     try {
-      initial = await _source.getInitialLink();
+      if (source is RawLinkSource) {
+        initial = await source.getInitialLinkString();
+      } else {
+        initialUri = await source.getInitialLink();
+        initial = initialUri?.toString();
+      }
     } catch (_) {
       initial = null; // The platform could not tell us; treat as "no launch link".
     }
-    if (initial != null) await _handle(initial, isInitial: true);
+    if (initial != null) await _handle(initial, uri: initialUri, isInitial: true);
     // The deferred-link check starts after everything else and nothing waits for it.
     scheduleMicrotask(_deferred.start);
   }
@@ -236,45 +278,93 @@ class Strybok {
   }
 
   /// Whether [uri] looks like a Strybok link of this app: `https`, a host
-  /// from [allowedHosts], default port, no credentials and a single slug path.
-  /// Query and fragment do not matter.
-  bool isStrybokUri(Uri uri) =>
-      uri.scheme == 'https' &&
-      allowedHosts.contains(uri.host.toLowerCase()) &&
-      uri.userInfo.isEmpty &&
-      (!uri.hasPort || uri.port == 443) &&
-      _slugPath.hasMatch(uri.path);
+  /// from [allowedHosts], default port, no credentials and a single slug path
+  /// — or, with [parameterLinks], a route path or a Firebase long link. Query
+  /// and fragment do not matter (except the `link` of a long link).
+  ///
+  /// With [parameterLinks] the rules are meant for the URL as received, which
+  /// [isStrybokUrl] takes; a [Uri] has already been rewritten by `Uri.parse`.
+  bool isStrybokUri(Uri uri) => _lookupOf('$uri', uri) != null;
+
+  /// [isStrybokUri] for [url] exactly as it was received.
+  bool isStrybokUrl(String url) => _lookupOf(url, null) != null;
 
   /// Resolves [uri] through the API without touching [links].
   ///
   /// Throws a [StrybokException]: [UnsupportedLinkException] before any
   /// network call when the URI is not ours, [LinkNotFoundException] for unknown,
   /// disabled or expired links, and network/timeout/server errors otherwise.
-  Future<ResolvedDeepLink> resolveUri(Uri uri) async {
+  ///
+  /// With [parameterLinks], prefer [resolveUrl] with the URL as received.
+  Future<ResolvedDeepLink> resolveUri(Uri uri) => _resolve('$uri', uri);
+
+  /// [resolveUri] for [url] exactly as it was received (from a QR scanner, a
+  /// push notification, a link source of your own). The rules of
+  /// [parameterLinks] are applied to this string: the path is sent as
+  /// received, never decoded or normalised.
+  Future<ResolvedDeepLink> resolveUrl(String url) => _resolve(url, null);
+
+  Future<ResolvedDeepLink> _resolve(String url, Uri? uri) async {
     _checkNotDisposed();
-    if (!isStrybokUri(uri)) {
-      throw UnsupportedLinkException('Not a link for this app', uri: uri);
+    final parsed = uri ?? Uri.tryParse(url);
+    // Of the query only the campaign parameters (and with parameterLinks the payload keys) are
+    // sent; the rest and the fragment are not needed for the lookup and may hold private data.
+    final lookup = parsed == null ? null : _lookupOf(url, parsed);
+    if (parsed == null || lookup == null) {
+      throw UnsupportedLinkException('Not a link for this app', uri: parsed);
     }
-    // Of the query only the campaign parameters are sent; the rest and the fragment are not
-    // needed for the lookup and may hold private data.
-    final campaign = campaignQuery(uri.hasQuery ? uri.query : '');
-    final lookup =
-        '${Uri(scheme: 'https', host: uri.host.toLowerCase(), path: uri.path)}'
-        '${campaign.isEmpty ? '' : '?$campaign'}';
     final endpoint = _endpoint('/v1/public/resolve', {'url': lookup});
 
     final response = await _send(
       () => _http.get(endpoint, headers: const {'Accept': 'application/json'}),
-      uri: uri,
+      uri: parsed,
       timeoutMessage: 'The resolve request timed out',
     );
-    if (response.statusCode == 200) return _parse(uri, response.body);
-    if (response.statusCode == 404) throw LinkNotFoundException(uri: uri);
+    if (response.statusCode == 200) return _parse(parsed, response.body);
+    if (response.statusCode == 404) throw LinkNotFoundException(uri: parsed);
     throw StrybokServerException(
       'Unexpected status ${response.statusCode}',
-      uri: uri,
+      uri: parsed,
       statusCode: response.statusCode,
     );
+  }
+
+  /// The `lookup` of a link: [url] as received, [uri] when the caller already
+  /// parsed it. `null` when it is not a link of this app.
+  String? _lookupOf(String url, Uri? uri) {
+    final payloadKeys = _payloadKeys;
+    if (payloadKeys == null) {
+      final parsed = uri ?? Uri.tryParse(url);
+      return parsed == null ? null : _slugLookup(parsed);
+    }
+    return parameterLinkLookup(url, allowedHosts, payloadKeys);
+  }
+
+  /// The rules and the lookup of the versions before [parameterLinks], which
+  /// read a link through `Uri.parse`: still everything without the option, and
+  /// the rule for deferred links with it.
+  String? _slugLookup(Uri uri) {
+    if (!_isSlugLink(uri)) return null;
+    final campaign = campaignQuery(uri.hasQuery ? uri.query : '');
+    return '${Uri(scheme: 'https', host: uri.host.toLowerCase(), path: uri.path)}'
+        '${campaign.isEmpty ? '' : '?$campaign'}';
+  }
+
+  /// `https`, a host from [allowedHosts], default port, no credentials and a
+  /// single slug path.
+  bool _isSlugLink(Uri uri) =>
+      uri.scheme == 'https' &&
+      allowedHosts.contains(uri.host.toLowerCase()) &&
+      uri.userInfo.isEmpty &&
+      (!uri.hasPort || uri.port == 443) &&
+      _slugPath.hasMatch(uri.path);
+
+  static List<String>? _checkedPayloadKeys(ParameterLinks? parameterLinks) {
+    if (parameterLinks == null) return null;
+    final keys = List<String>.unmodifiable(parameterLinks.payloadKeys);
+    final problem = payloadKeysProblem(keys);
+    if (problem != null) throw ArgumentError.value(parameterLinks, 'parameterLinks', problem);
+    return keys;
   }
 
   /// Asks the service for a short link to [routePath], a screen of this app —
@@ -378,13 +468,17 @@ class Strybok {
 
   // ---------------------------------------------------------------------------
 
-  Future<void> _handle(Uri uri, {bool isInitial = false}) async {
-    if (_disposed || !isStrybokUri(uri)) return;
+  /// A link from the link source: [url] as received, [uri] when the source
+  /// handed over a parsed one.
+  Future<void> _handle(String url, {Uri? uri, bool isInitial = false}) async {
+    if (_disposed) return;
+    final parsed = uri ?? Uri.tryParse(url);
+    if (parsed == null || _lookupOf(url, parsed) == null) return;
     // From here on a deferred link is dropped: one launch, one navigation.
     _normalLinkAccepted = true;
-    if (_isDuplicate(uri)) return;
+    if (_isDuplicate(url)) return;
     try {
-      final link = await resolveUri(uri);
+      final link = await _resolve(url, parsed);
       if (_disposed) return; // Disposed while the request was in flight.
       if (isInitial) _initialLink = link;
       _deliver(link);
@@ -438,8 +532,9 @@ class Strybok {
       } when routePath.startsWith('/') && !routePath.startsWith('//')) {
         if (probabilistic && json['matched'] != 'probabilistic') return null;
         final uri = Uri.tryParse(url);
-        // The server is not trusted to name a link of another app.
-        if (uri == null || !isStrybokUri(uri)) return null;
+        // The server is not trusted to name a link of another app. Deferred links are stored
+        // links, so the slug rule applies with or without parameterLinks.
+        if (uri == null || !_isSlugLink(uri)) return null;
         final payload = json['payload'];
         return ResolvedDeepLink(
           uri: uri,
@@ -465,10 +560,9 @@ class Strybok {
   };
 
   /// The OS (or the plugin) can hand over the same tap twice, e.g. as the
-  /// initial link and again on the stream.
-  bool _isDuplicate(Uri uri) {
+  /// initial link and again on the stream. Compared as the string received.
+  bool _isDuplicate(String key) {
     final now = _now();
-    final key = '$uri';
     final duplicate =
         _lastUri == key && _lastUriAt != null && now.difference(_lastUriAt!) < dedupeWindow;
     _lastUri = key;

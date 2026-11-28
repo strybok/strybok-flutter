@@ -11,8 +11,24 @@ abstract interface class LinkSource {
   Stream<Uri> get uriStream;
 }
 
+/// A [LinkSource] that can also hand over every link as the exact string the
+/// platform received. The SDK then reads only these strings.
+///
+/// It matters with `parameterLinks`: whether a URL is a link of this app and
+/// the path that is sent are read from the URL as received, and a [Uri] has
+/// already been rewritten by `Uri.parse` (it removes `.` and `..` segments and
+/// changes escapes). [AppLinksSource] and `FakeLinkSource` implement it.
+abstract interface class RawLinkSource implements LinkSource {
+  /// The link that launched the app, exactly as received, or `null`.
+  Future<String?> getInitialLinkString();
+
+  /// Links received while the app is running, exactly as received. Like
+  /// [uriStream] it may replay the initial link.
+  Stream<String> get stringLinkStream;
+}
+
 /// [LinkSource] backed by the `app_links` plugin.
-class AppLinksSource implements LinkSource {
+class AppLinksSource implements RawLinkSource {
   AppLinksSource([AppLinks? appLinks]) : _appLinks = appLinks ?? AppLinks();
 
   final AppLinks _appLinks;
@@ -22,4 +38,10 @@ class AppLinksSource implements LinkSource {
 
   @override
   Stream<Uri> get uriStream => _appLinks.uriLinkStream;
+
+  @override
+  Future<String?> getInitialLinkString() => _appLinks.getInitialLinkString();
+
+  @override
+  Stream<String> get stringLinkStream => _appLinks.stringLinkStream;
 }

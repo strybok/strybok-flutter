@@ -332,7 +332,7 @@ void main() {
       expect(request.headers['accept'], 'application/json');
       expect(
         request.body,
-        '{"platform":"android","clickId":"$clickId","packageName":"$package","sdkVersion":"0.3.0"}',
+        '{"platform":"android","clickId":"$clickId","packageName":"$package","sdkVersion":"0.4.0"}',
       );
 
       final link = links.single;
@@ -1033,7 +1033,7 @@ void main() {
       expect(request.headers['accept'], 'application/json');
       expect(
         request.body,
-        '{"platform":"ios","clickId":"$clickId","bundleId":"$bundle","sdkVersion":"0.3.0"}',
+        '{"platform":"ios","clickId":"$clickId","bundleId":"$bundle","sdkVersion":"0.4.0"}',
       );
       expect(links, hasLength(2));
       expect(links.last.uri, Uri.parse('https://$host/invite777'));
@@ -1269,7 +1269,7 @@ void main() {
       expect(
         request.body,
         '{"platform":"ios","bundleId":"$bundle","deviceFamily":"iphone","locale":"en-GB",'
-        '"sdkVersion":"0.3.0"}',
+        '"sdkVersion":"0.4.0"}',
       );
       expect(links.single.isDeferred, isTrue);
       expect(links.single.isProbabilisticMatch, isTrue);

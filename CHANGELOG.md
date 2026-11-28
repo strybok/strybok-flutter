@@ -1,3 +1,39 @@
+## 0.4.0
+
+- Links without an API call, optional and off by default: the new `parameterLinks` option
+  (`ParameterLinks(payloadKeys: [...])`) delivers path links such as
+  `https://<host>/product/42?id=7` and Firebase long links `https://<host>/?link=…` that the
+  owner switched on for the application. The keys come from `parameterLinks` of the integration
+  guide (`GET /v1/apps/:appId/integration`, shown on the dashboard's setup screen). With it:
+  - a route path and a long link are links of the app too, besides a single slug; an empty path
+    is the root; reserved paths such as `/favicon.ico` or `/.well-known/…` never are;
+  - resolving sends the path as received, the first value of each configured key (1–256
+    characters without control characters, re-encoded) and the `utm_*` values; for a long link
+    the deep link's scheme, host and path with its values of the keys, plus `apn` and `ibi`.
+    Nothing else of the query and never the fragment;
+  - the delivered link has the route and payload the server read, never the tapped path, and
+    `app_open` carries the `linkId` the server returned;
+  - any address of the hosts that is a valid route is resolved, so `onError` gets a
+    `LinkNotFoundException` for one that is no link.
+- An invalid list of keys (more than 20, a key twice, a key that is not 1–40 characters of
+  `A–Z a–z 0–9 _ . -`, starts with `utm_` in any case, or is `st`, `sd`, `si` or `strybok_click`)
+  makes the `Strybok` constructor throw an `ArgumentError`.
+- The rules read a link exactly as the platform received it, because `Uri.parse` removes dot
+  segments and rewrites escapes. New `RawLinkSource`: a `LinkSource` that also hands over strings
+  (`getInitialLinkString()`, `stringLinkStream`). `AppLinksSource` implements it with the string
+  API of `app_links`, and `FakeLinkSource` with the new `initialLinkString` and `emitString`.
+  New `resolveUrl(String)` and `isStrybokUrl(String)` next to `resolveUri` and `isStrybokUri`. A
+  `LinkSource` of your own that only has `Uri`s keeps working; with the option its links are read
+  as `Uri.parse` left them.
+- Unchanged without the option: the same links are accepted and every request is the one 0.3.0
+  sent (a link is still read through `Uri.parse` then). Deferred links keep the single-slug rule
+  with the option as well: the URL of a redeem or match answer and a pasted link must have one
+  slug segment.
+- Not source-breaking: the new constructor parameter is optional and `LinkSource` is unchanged.
+- Covered by unit tests only, against the shared test vectors of the SDK contract (77 tapped
+  URLs, 19 configurations) and a stub transport. Never run on a device or against the production
+  API.
+
 ## 0.3.0
 
 - Campaign values. `ResolvedDeepLink.campaign` is a `LinkCampaign` with the nullable strings
